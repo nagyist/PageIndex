@@ -44,7 +44,7 @@ def indexed_doc(local_client, sample_pdf, monkeypatch):
     """A document indexed through a stubbed standard pipeline."""
     def fake_page_index_main(doc, opt=None, logger=None, page_list=None):
         assert opt.if_add_node_summary == "yes"
-        assert opt.if_add_node_text == "yes"
+        assert opt.if_add_node_text == "no"
         assert logger is not None
         assert page_list is not None
         assert all(isinstance(t, tuple) and len(t) == 2 for t in page_list)
@@ -2532,12 +2532,13 @@ def test_format_tree_node_keeps_key_items():
 
 # ── retry-ladder and summary fail-loud edges (twelfth review) ──
 
-def test_summarize_tree_all_empty_replies_fail_loud(monkeypatch):
+@pytest.mark.parametrize("reply", ["", '{"summary": ""}'])
+def test_summarize_tree_all_empty_replies_fail_loud(monkeypatch, reply):
     """Empty-content replies (content filter, spent output cap) must not
     vouch for the model: a raw-text short leaf cannot carry the run when
     every model reply comes back blank."""
     async def blank(model, prompt):
-        return ""
+        return reply
     monkeypatch.setattr(pageindex.utils, "llm_acompletion", blank)
     pdf_pages = [("tiny", 1), ("beta " * 300, 300)]
     structure = [{"title": "R", "start_index": 1, "end_index": 2,
