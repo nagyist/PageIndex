@@ -71,6 +71,104 @@ def test_rtl_sign_takes_a_multi_code_point_glyph():
     assert _rtl_sign("") == 1
 
 
+def _helvetica(widths, encoding="/WinAnsiEncoding"):
+    return ("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+            f"/Encoding {encoding} /FirstChar 32 /LastChar 126 /Widths [{' '.join(map(str, widths))}] >>")
+
+
+def test_ink_past_the_advance_does_not_split_the_word(tmp_path):
+    """A glyph whose ink reaches past its advance (a bold-italic 'f') must not
+    open a space before the next letters: the gap is measured from the pen
+    end the font's width for the char's code gives, not from the ink."""
+    from conftest import build_pdf
+    from pageindex.flash.main import extract_toc
+
+    widths = [556] * 95
+    widths[ord("f") - 32] = 50   # Helvetica's 'f' ink now reaches into the 'e'
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(build_pdf(["inference"], font=_helvetica(widths)))
+    assert extract_toc(str(pdf))["page_texts"] == ["inference"]
+
+
+def test_dropped_glyph_after_ink_past_the_advance_does_not_split_the_word(tmp_path):
+    """An 'f' painted first where the word's second 'f' lands makes PDFium drop
+    that glyph; the re-emitted 'f' starts at the first one's pen end, not at
+    its ink edge. The 'f' PDFium keeps reads last."""
+    from conftest import build_pdf
+    from pageindex.flash.main import extract_toc
+
+    widths = [556] * 95
+    widths[ord("f") - 32] = 50
+    lines, x = [], 72.0
+    for ch in "the effects of":
+        lines.append((round(x, 3), 720, 12, ch))
+        x += widths[ord(ch) - 32] * 12 / 1000
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(build_pdf([[(lines[6][0], 720, 12, "f")] + lines], font=_helvetica(widths)))
+    assert extract_toc(str(pdf))["page_texts"] == ["the effects off"]
+
+
+def test_dropped_glyph_with_no_next_survivor_advances_by_its_code_width():
+    """With no later glyph to measure against, a re-emitted glyph starts at
+    the previous glyph's pen end and advances by its own code width."""
+    from pageindex.flash.parser_pdfium_charlevel.unicode_apply import _synthesize_dropped_glyphs
+
+    obj = {"fs_raw": 10.0, "scale_x": 1.0, "fs_eff": 10.0, "l": 0.0, "b": 0.0, "font_name": "F"}
+    prev = {"i": 0, "ch": "f", "ox": 100.0, "oy": 700.0, "right": 104.0, "code_w": 0.25, "obj": obj}
+    raw_chars = [prev]
+    _synthesize_dropped_glyphs([{"t": "f", "owner": obj, "w": 0.25, "prev_i": 0, "next_i": None}],
+                               raw_chars, {0: prev})
+    assert (raw_chars[-1]["ox"], raw_chars[-1]["w_synth"]) == (102.5, 2.5)
+
+
+def test_rotated_text_ignores_code_widths(tmp_path):
+    """A rotated pen moves along y, so a narrow glyph's code width must not
+    open gaps in rotated words."""
+    from conftest import build_pdf
+    from pageindex.flash.main import extract_toc
+
+    widths = [556] * 95
+    widths[ord("'") - 32] = 191
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(build_pdf([b"BT /F1 12 Tf 0 -1 1 0 300 700 Tm (O'Brien rock'n'roll) Tj ET"],
+                              font=_helvetica(widths)))
+    assert extract_toc(str(pdf))["page_texts"] == ["O'Brien rock'n'roll"]
+
+
+def test_rtl_chars_ignore_code_widths(tmp_path):
+    """PDFium returns Hebrew in logical order, so the code walk pairs each
+    char with its mirror's code; that width must not move the line's gaps."""
+    from conftest import build_pdf
+    from pageindex.flash.main import extract_toc
+
+    widths = [556] * 95
+    widths[ord("a") - 32], widths[ord("b") - 32] = 550, 150
+    hebrew = "<< /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [97 /afii57664 /afii57665] >>"
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(build_pdf(["xyba z"], font=_helvetica(widths, hebrew)))
+    assert extract_toc(str(pdf))["page_texts"] == ["xy \u05d0\u05d1 z"]
+
+
+def test_composite_font_widths_read_both_w_forms():
+    """/W holds `c [w1 w2 ...]` and `c_first c_last w` entries, /DW covers
+    the rest, and a range is bounded to two-byte codes."""
+    from types import SimpleNamespace
+    from PyPDF2.generic import ArrayObject, DictionaryObject, NameObject, NumberObject
+    from pageindex.flash.parser_pdfium_charlevel.font_unicode import _font_widths
+
+    def array(*items):
+        return ArrayObject(NumberObject(item) if isinstance(item, int) else item for item in items)
+
+    descendant = DictionaryObject({NameObject("/DW"): NumberObject(800),
+                                   NameObject("/W"): array(10, array(500, 600), 20, 2 ** 31, 700)})
+    font = DictionaryObject({NameObject("/Subtype"): NameObject("/Type0"),
+                             NameObject("/Encoding"): NameObject("/Identity-H"),
+                             NameObject("/DescendantFonts"): ArrayObject([descendant])})
+    widths = _font_widths(SimpleNamespace(_resolve_object=lambda xref: font), 1)
+    assert [widths(code) for code in (10, 11, 12, 20, 0xFFFF, 5)] == pytest.approx(
+        [0.5, 0.6, 0.8, 0.7, 0.7, 0.8])
+
+
 def test_optimize_full_keyless_reports_file_errors_first(tmp_path, monkeypatch):
     """No credential pre-check: a bad path is a FileNotFoundError even
     keyless (validation runs first), and the LLM-free spellings still run
